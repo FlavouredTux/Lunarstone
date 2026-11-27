@@ -1,0 +1,6 @@
+CompileFlags:
+  CompilationDatabase: build/debug
+  # GCC-only flags: reflection (the headers fall back without it) and CMake's module scanning.
+  Remove: [-freflection, -fmodules-ts, -fmodule-mapper=*, -fdeps-format=*, -Werror]
+  # GCC-only warning flags like -Wlogical-op.
+  Add: [-Wno-unknown-warning-option]

@@ -1,0 +1,6 @@
+// Generated from engine/src/ClassRegistrySlice.cpp.in: slice @LUNAR_SLICE@ of the built-in class table.
+#include "ClassRegistrySlice.hpp"
+
+template void lunar::detail::addClassSlice<@LUNAR_SLICE@>(ClassTable&);
+
+static_assert(@LUNAR_SLICE@ < lunar::detail::classSlices, "LUNAR_CLASS_SLICES and classSlices disagree");

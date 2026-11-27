@@ -1,0 +1,6 @@
+# TEST() defines a static function plus a registrar per test, on purpose.
+InheritParentConfig: true
+Checks: >
+  -misc-use-anonymous-namespace,
+  -bugprone-throwing-static-initialization,
+  -modernize-raw-string-literal,

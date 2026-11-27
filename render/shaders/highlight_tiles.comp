@@ -1,0 +1,28 @@
+#version 450
+
+// Which highlights each 8 x 8 tile of the highlights' mask has in it, a bit
+// per id (HighlightPass): what highlight.frag looks at first, so the pixels
+// with none near them skip their outline's search. The outline reaches at
+// most 8 pixels, so a pixel's search never leaves its tile's neighbours.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform usampler2D mask;
+layout(set = 0, binding = 3, r32ui) uniform writeonly uimage2D tiles;
+
+shared uint ids;
+
+void main()
+{
+    if (gl_LocalInvocationIndex == 0u)
+        ids = 0u;
+    barrier();
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (all(lessThan(p, textureSize(mask, 0)))) {
+        uint id = texelFetch(mask, p, 0).r;
+        if (id != 0u)
+            atomicOr(ids, 1u << id);
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u)
+        imageStore(tiles, ivec2(gl_WorkGroupID.xy), uvec4(ids));
+}

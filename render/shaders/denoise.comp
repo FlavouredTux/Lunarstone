@@ -1,0 +1,135 @@
+#version 460
+
+// The denoiser of the local lights' shared shadow ray (mesh.frag's DENOISE
+// outputs). Each pixel's ray to one of the rest of its lights says 0 or 1;
+// the pixels around it on the same surface sent theirs to others, so their
+// average is what the rest's light really reaches. An edge-aware a-trous
+// blur runs over that 0 or 1 with steps 1, 2, 4 and 8, the first pass
+// working it out from the pixels' outputs as it reads them. A neighbour counts as much as it lies on the
+// pixel's surface (on the plane its depth slopes along, and facing the same
+// way) and, once the noise has thinned, as much as it found the same.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// What the picture changes by between the shared ray reaching and not, and
+// that times what it found (decals blended in): their ratio is the ray's.
+layout(set = 0, binding = 0) uniform sampler2D restDelta;
+layout(set = 0, binding = 1) uniform sampler2D restDeltaSeen;
+// The opaque surface: its geometric normal and view depth (0 for none).
+layout(set = 0, binding = 2) uniform sampler2D guide;
+// The last pass's result (red, -1 where no ray was shared), and this one's.
+layout(set = 0, binding = 3) uniform sampler2D source;
+layout(set = 0, binding = 4, r32f) uniform writeonly image2D target;
+
+// Pixels between taps; and whether this is the first pass, which reads the
+// rays instead of source. A pipeline per pass: the tile below is then as
+// big as its pass needs, and its loads are a loop of known length.
+layout(constant_id = 0) const int step = 1;
+layout(constant_id = 1) const bool first = false;
+
+float luminance(vec3 c)
+{
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// A blur's group of 16 x 16 pixels and every tap they reach, step pixels
+// round it, read into shared memory once: each pixel's eight taps then come
+// from there instead of from two texture fetches apiece, which the blur
+// spent its time waiting on. What's off the image goes in as no ray (-1),
+// which a tap skips as it skipped what's off the image.
+const int group = 16;
+const int tile = group + 2 * step;
+shared float tileSeen[tile * tile];
+shared vec4 tileGuide[tile * tile];
+
+// How the depth changes a pixel along axis: the gentler of the two sides,
+// so an edge on one side doesn't tilt the surface. From the group's tile,
+// whose apron is a step (at least a pixel) wide; what's off the image has
+// no depth there, so it's left out as it was when the image ended.
+float depthSlope(ivec2 local, ivec2 axis, float z)
+{
+    float slope = 1e30;
+    for (int side = -1; side <= 1; side += 2) {
+        ivec2 q = local + axis * side;
+        float zq = tileGuide[q.y * tile + q.x].w;
+        if (zq <= 0.0)
+            continue;
+        float s = (zq - z) * float(side);
+        if (abs(s) < abs(slope))
+            slope = s;
+    }
+    return slope > 1e29 ? 0.0 : slope;
+}
+
+// What a pixel's ray reached of the rest's light, 0 to 1, or -1 where no
+// ray was shared (or it changes nothing).
+float raySeen(ivec2 p)
+{
+    float delta = luminance(texelFetch(restDelta, p, 0).rgb);
+    return delta < 1e-5 ? -1.0 : clamp(luminance(texelFetch(restDeltaSeen, p, 0).rgb) / delta, 0.0, 1.0);
+}
+
+void main()
+{
+    ivec2 size = textureSize(guide, 0);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    bool inside = all(lessThan(p, size));
+    // The first pass reads what each ray found straight from the opaque
+    // pass's outputs, rather than a pass of its own writing it out first.
+    ivec2 origin = ivec2(gl_WorkGroupID.xy) * group - step;
+    for (int i = int(gl_LocalInvocationIndex); i < tile * tile; i += group * group) {
+        ivec2 q = origin + ivec2(i % tile, i / tile);
+        bool on = all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, size));
+        tileSeen[i] = on ? (first ? raySeen(q) : texelFetch(source, q, 0).r) : -1.0;
+        tileGuide[i] = on ? texelFetch(guide, q, 0) : vec4(0.0);
+    }
+    barrier();
+    if (!inside)
+        return;
+    ivec2 local = ivec2(gl_LocalInvocationID.xy) + step;
+    float center = tileSeen[local.y * tile + local.x];
+    vec4 g = tileGuide[local.y * tile + local.x];
+    if (center < 0.0 || g.w <= 0.0) {
+        imageStore(target, p, vec4(center));
+        return;
+    }
+    float z = g.w;
+    vec2 slope = vec2(depthSlope(local, ivec2(1, 0), z), depthSlope(local, ivec2(0, 1), z));
+    // Off the pixel's plane by a hundredth of the depth (and a little) takes
+    // a neighbour's weight down by e; exp(-x) as exp2 of x over ln 2.
+    float offPlane = -1.442695 / (0.01 * z + 0.02);
+    // After the first blur the noise has thinned: a neighbour that still
+    // differs a lot is across a shadow's edge, not its noise, and the
+    // shadow keeps its edge (SVGF's luminance stop). Off by a quarter: e.
+    float unlike = step == 1 ? 0.0 : -1.442695 / 0.25;
+
+    // The linear B-spline's taps, 3 a side.
+    const float kernel[2] = float[2](0.5, 0.25);
+    float sum = center * kernel[0] * kernel[0];
+    float weight = kernel[0] * kernel[0];
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            if (x == 0 && y == 0)
+                continue;
+            ivec2 offset = ivec2(x, y) * step;
+            int at = (local.y + offset.y) * tile + local.x + offset.x;
+            float v = tileSeen[at];
+            if (v < 0.0)
+                continue;
+            vec4 gq = tileGuide[at];
+            // Turned away: the 32nd power of the cosine, by squaring.
+            float facing = max(dot(g.xyz, gq.xyz), 0.0);
+            facing *= facing;
+            facing *= facing;
+            facing *= facing;
+            facing *= facing;
+            facing *= facing;
+            float expected = z + dot(slope, vec2(offset));
+            float w = kernel[abs(x)] * kernel[abs(y)] * facing
+                      * exp2(abs(gq.w - expected) * offPlane + abs(v - center) * unlike);
+            sum += v * w;
+            weight += w;
+        }
+    }
+    imageStore(target, p, vec4(sum / weight));
+}

@@ -1,0 +1,11 @@
+/build/
+/.cache/
+/.claude/
+/sessions/
+/recordings/
+*.pcap
+*.pcapng
+*.keys
+*.joinscript.json
+*.log
+__pycache__/
